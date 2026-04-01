@@ -281,12 +281,10 @@ If you use v4mer in your research, please cite:
 ### Related Publications
 
 - Yamagishi, M. E. B. (2017). *Mathematical Grammar of Biology*. Springer. https://doi.org/10.1007/978-3-319-62689-5
-- Chargaff, E. (1968). What really is DNA? *Progress in Nucleic Acid Research and Molecular Biology*, 8, 297-333.
 - Marçais, G. & Kingsford, C. (2011). A fast, lock-free approach for efficient parallel counting of occurrences of k-mers. *Bioinformatics*, 27(6), 764-770.
 
 
 ## Acknowledgments
 
-- Mathematical framework from *Mathematical Grammar of Biology* by Michel Eduardo Beleza Yamagishi
 - Performance optimizations inspired by [Jellyfish](https://github.com/gmarcais/Jellyfish)
 - Named for the Klein four-group V₄ (Vierergruppe)
