@@ -131,3 +131,23 @@ configuration. Gzip decompression and physical output writes remain serial.
 ## License
 
 MIT License. See [LICENSE](LICENSE).
+
+## Citation
+
+Yamagishi, Michel Eduardo Beleza. *Mathematical Grammar of Biology*.
+SpringerBriefs in Mathematics. Cham: Springer, 2017. DOI:
+[10.1007/978-3-319-62689-5](https://doi.org/10.1007/978-3-319-62689-5).
+eBook ISBN: 978-3-319-62689-5. Softcover ISBN: 978-3-319-62688-8.
+
+```bibtex
+@book{yamagishi2017mathematical,
+  author    = {Yamagishi, Michel Eduardo Beleza},
+  title     = {Mathematical Grammar of Biology},
+  series    = {SpringerBriefs in Mathematics},
+  publisher = {Springer},
+  address   = {Cham},
+  year      = {2017},
+  doi       = {10.1007/978-3-319-62689-5},
+  isbn      = {978-3-319-62689-5}
+}
+```
