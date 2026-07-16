@@ -98,13 +98,31 @@ Jellyfish used canonical mode (`-C`) followed by text dumping.
 | Minimum 4-thread counting speedup vs. 1 thread | 2.73x |
 | Worst 8-thread end-to-end change vs. 4 threads | +0.8% |
 
-### Representative end-to-end results at four threads
+### Complete four-thread comparison
+
+All values below are median end-to-end times from the measured matrix.
 
 | Dataset | Format | k | V4mer (s) | Jellyfish (s) | Speedup | RSS ratio |
 |---|---|---:|---:|---:|---:|---:|
+| Arcopilus | FASTA | 21 | 2.300 | 6.455 | 2.81x | 1.95x |
+| Arcopilus | FASTA | 31 | 2.640 | 8.060 | 3.05x | 1.16x |
+| Arcopilus | FASTA | 33 | 2.855 | 7.330 | 2.57x | 1.81x |
+| Arcopilus | FASTA | 57 | 3.870 | 9.750 | 2.52x | 0.99x |
 | Arcopilus | FASTA | 101 | 6.350 | 23.945 | 3.77x | 0.90x |
+| HuRef chr22 | FASTA | 21 | 2.020 | 5.530 | 2.74x | 1.93x |
+| HuRef chr22 | FASTA | 31 | 2.485 | 6.715 | 2.70x | 1.17x |
+| HuRef chr22 | FASTA | 33 | 2.830 | 7.075 | 2.50x | 1.82x |
+| HuRef chr22 | FASTA | 57 | 3.710 | 9.540 | 2.57x | 0.97x |
 | HuRef chr22 | FASTA | 101 | 6.280 | 17.700 | 2.82x | 0.90x |
+| MT147 | FASTQ | 21 | 2.710 | 6.265 | 2.31x | 0.85x |
+| MT147 | FASTQ | 31 | 2.900 | 6.785 | 2.34x | 0.51x |
+| MT147 | FASTQ | 33 | 3.165 | 6.955 | 2.20x | 0.78x |
 | MT147 | FASTQ | 57 | 3.670 | 7.720 | 2.10x | 0.42x |
+| MT147 | FASTQ | 101 | 4.445 | 9.020 | 2.03x | 0.38x |
+| MT147 | FASTQ gzip | 21 | 3.150 | 6.215 | 1.97x | 0.75x |
+| MT147 | FASTQ gzip | 31 | 3.400 | 6.690 | 1.97x | 0.46x |
+| MT147 | FASTQ gzip | 33 | 3.705 | 7.460 | 2.01x | 0.69x |
+| MT147 | FASTQ gzip | 57 | 4.450 | 7.985 | 1.79x | 0.43x |
 | MT147 | FASTQ gzip | 101 | 4.910 | 8.365 | 1.70x | 0.34x |
 
 `RSS ratio` is V4mer peak resident memory divided by Jellyfish peak resident
