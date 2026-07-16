@@ -1,1106 +1,1253 @@
 /**
  * @file v4mer.cpp
- * @brief v4mer - Klein V₄ k-mer counter (Jellyfish-compatible output)
- * @author Michel Eduardo Beleza Yamagishi
- * @version 1.0
- * @date 2026
+ * @brief Parallel V4 k-mer counter.
  *
- * Uses Klein four-group V₄ = {I, R, C, RC} internally for efficient canonicalization,
- * then outputs in Jellyfish-compatible format (min of forward and reverse-complement).
- *
- * Supports FASTA/FASTQ formats (plain or gzip-compressed).
- *
- * Memory-optimized version with:
- * - Compact 16-bit counts (with overflow table for rare high-count k-mers)
- * - Robin Hood hashing for 90% load factor
- * - Better capacity estimation
- * - Zero-copy canonical k-mer computation
- *
- * Compile: g++ -std=c++17 -O3 -march=native -flto -o v4mer v4mer.cpp -lz
+ * The implementation uses the shared V4 encoding, canonicalization, hash
+ * table, overflow handling, and buffered output defined in v4mer_core.hpp.
  */
 
-#include <iostream>
+#define V4MER_CORE_ONLY
+#include "v4mer_core.hpp"
+#undef V4MER_CORE_ONLY
+
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <exception>
 #include <fstream>
-#include <string>
-#include <cstdint>
-#include <algorithm>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <fcntl.h>
+#include <iterator>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <sys/types.h>
+#include <thread>
 #include <unistd.h>
-#include <zlib.h>
-#include <vector>
-#include <stdexcept>
-#include <unordered_map>
 
-// ============================================================================
-// FILE FORMAT AND COMPRESSION ENUMS
-// ============================================================================
+namespace parallel_v4mer {
 
-enum class FileFormat { FASTA, FASTQ };
-enum class CompressionType { NONE, GZIP };
-
-// ============================================================================
-// CONSTANTS AND LOOKUP TABLES
-// ============================================================================
-
-static constexpr int8_t BASE_ENCODING[256] = {
-    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-    -1,  0, -1,  1, -1, -1, -1,  2, -1, -1, -1, -1, -1, -1, -1, -1,
-    -1, -1, -1, -1,  3, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-    -1,  0, -1,  1, -1, -1, -1,  2, -1, -1, -1, -1, -1, -1, -1, -1,
-    -1, -1, -1, -1,  3, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1
+struct InputJob {
+    std::string bytes;
+    size_t emit_from = 0;
+    bool raw_fasta = false;
 };
 
-static constexpr char BASE_DECODING[4] = {'A', 'C', 'G', 'T'};
+#ifndef V4MER_SHARD_COUNT
+#define V4MER_SHARD_COUNT 64
+#endif
+#ifndef V4MER_UPDATE_BATCH_SIZE
+#define V4MER_UPDATE_BATCH_SIZE 512
+#endif
+#ifndef V4MER_WINDOWS_PER_JOB
+#define V4MER_WINDOWS_PER_JOB (256 * 1024)
+#endif
 
-// Transform indices for Klein four-group
-enum Transform : uint8_t {
-    TRANSFORM_I  = 0,  // Identity (forward)
-    TRANSFORM_R  = 1,  // Reverse
-    TRANSFORM_C  = 2,  // Complement
-    TRANSFORM_RC = 3   // Reverse-Complement
+static constexpr size_t SHARD_COUNT = V4MER_SHARD_COUNT;
+static constexpr size_t MAX_SHARD_COUNT = 256;
+static constexpr size_t UPDATE_BATCH_SIZE = V4MER_UPDATE_BATCH_SIZE;
+static constexpr size_t MAX_PENDING_UPDATES = UPDATE_BATCH_SIZE * 4;
+static constexpr size_t WINDOWS_PER_JOB = V4MER_WINDOWS_PER_JOB;
+static constexpr size_t OUTPUT_BLOCK_SIZE = 1024 * 1024;
+static constexpr size_t MAX_OUTPUT_FORMATTERS = 4;
+static constexpr size_t OUTPUT_QUEUE_BLOCKS = 2;
+static constexpr size_t DEFAULT_LOAD_PERCENT = 90;
+
+struct MemoryPlan {
+    size_t shard_count = 0;
+    size_t expected_entries = 0;
+    size_t capacity_total = 0;
+    size_t capacity_per_shard = 0;
+    size_t table_bytes = 0;
+    size_t overflow_bytes = 0;
+    size_t input_buffer_bytes = 0;
+    size_t update_buffer_bytes = 0;
+    size_t output_buffer_bytes = 0;
+    size_t estimated_bytes = 0;
+    size_t budget_bytes = 0;
+    size_t load_percent = DEFAULT_LOAD_PERCENT;
 };
 
-// ============================================================================
-// TEMPLATE-BASED COMPACT HASH TABLE WITH ROBIN HOOD HASHING
-// ============================================================================
+static_assert(SHARD_COUNT >= 2 &&
+                  (SHARD_COUNT & (SHARD_COUNT - 1)) == 0,
+              "SHARD_COUNT must be a power of two");
+static_assert(UPDATE_BATCH_SIZE > 0, "UPDATE_BATCH_SIZE must be positive");
+static_assert(WINDOWS_PER_JOB > 0, "WINDOWS_PER_JOB must be positive");
 
-/**
- * @brief Memory-optimized hash table with Robin Hood hashing
- * @tparam WORDS Number of 64-bit words needed for k-mer storage
- *
- * Optimizations:
- * - 8-bit counts (4 bytes vs 8 bytes for 4 counts) - 25% smaller entries
- * - Robin Hood hashing allows 90% load factor (vs 50% with linear probing)
- * - Overflow table for rare k-mers with counts > 254
- *
- * Entry sizes (with packing):
- *   WORDS=1: 12 bytes (k ≤ 31)  - was 16 bytes (25% reduction)
- *   WORDS=2: 20 bytes (k ≤ 63)  - was 24 bytes (17% reduction)
- *   WORDS=3: 28 bytes (k ≤ 95)  - was 32 bytes (12% reduction)
- *   WORDS=4: 36 bytes (k ≤ 127) - was 40 bytes (10% reduction)
- */
-template<size_t WORDS>
-class CompactHashTable {
-public:
-    static constexpr uint64_t EMPTY_MARKER = ~0ULL;
-    static constexpr uint8_t OVERFLOW_MARKER = 255;
-
-    // Pack the struct to avoid padding between kmer and counts
-    #pragma pack(push, 1)
-    struct Entry {
-        uint64_t kmer[WORDS];      // Klein canonical k-mer
-        uint8_t count_I;           // Count for Identity transform (max 254, 255 = overflow)
-        uint8_t count_R;           // Count for Reverse transform
-        uint8_t count_C;           // Count for Complement transform
-        uint8_t count_RC;          // Count for Reverse-Complement transform
-
-        bool is_empty() const { return kmer[0] == EMPTY_MARKER; }
-        void mark_empty() {
-            kmer[0] = EMPTY_MARKER;
-            count_I = count_R = count_C = count_RC = 0;
-        }
-    };
-    #pragma pack(pop)
-
-    // Overflow entry stores full 64-bit counts for k-mers exceeding 16-bit limit
-    struct OverflowKey {
-        uint64_t kmer[WORDS];
-
-        bool operator==(const OverflowKey& other) const {
-            for (size_t i = 0; i < WORDS; ++i) {
-                if (kmer[i] != other.kmer[i]) return false;
-            }
-            return true;
-        }
-    };
-
-    struct OverflowKeyHash {
-        size_t operator()(const OverflowKey& key) const {
-            size_t hash = key.kmer[0];
-            for (size_t i = 1; i < WORDS; ++i) {
-                hash ^= key.kmer[i];
-            }
-            hash ^= hash >> 33;
-            hash *= 0xff51afd7ed558ccdULL;
-            hash ^= hash >> 33;
-            return hash;
-        }
-    };
-
-    struct OverflowCounts {
-        uint64_t count_I = 0;
-        uint64_t count_R = 0;
-        uint64_t count_C = 0;
-        uint64_t count_RC = 0;
-    };
-
+class JobQueue {
 private:
-    Entry* entries_;
-    size_t capacity_;
-    size_t mask_;
-    size_t entry_count_;
-    size_t kmer_length_;
-    bool use_mmap_;
-
-    // Overflow table for k-mers with counts > 254
-    std::unordered_map<OverflowKey, OverflowCounts, OverflowKeyHash> overflow_table_;
-
-public:
-    CompactHashTable(size_t k, size_t expected_entries)
-        : entry_count_(0), kmer_length_(k), use_mmap_(false) {
-
-        // Size table as power of 2, targeting ~90% load factor (Robin Hood allows this)
-        capacity_ = 1;
-        while (capacity_ < static_cast<size_t>(expected_entries * 1.15)) {
-            capacity_ <<= 1;
-        }
-        if (capacity_ < 1024) capacity_ = 1024;
-        mask_ = capacity_ - 1;
-
-        // Use mmap for large allocations (better memory management)
-        size_t alloc_size = capacity_ * sizeof(Entry);
-        if (alloc_size > 1024 * 1024) {
-            entries_ = static_cast<Entry*>(mmap(nullptr, alloc_size,
-                PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
-            if (entries_ != MAP_FAILED) {
-                use_mmap_ = true;
-                madvise(entries_, alloc_size, MADV_HUGEPAGE);
-            } else {
-                entries_ = new Entry[capacity_];
-            }
-        } else {
-            entries_ = new Entry[capacity_];
-        }
-
-        // Initialize all entries as empty
-        for (size_t i = 0; i < capacity_; ++i) {
-            entries_[i].mark_empty();
-        }
-    }
-
-    ~CompactHashTable() {
-        if (use_mmap_) {
-            munmap(entries_, capacity_ * sizeof(Entry));
-        } else {
-            delete[] entries_;
-        }
-    }
-
-    CompactHashTable(const CompactHashTable&) = delete;
-    CompactHashTable& operator=(const CompactHashTable&) = delete;
-
-    /**
-     * @brief Fast hash function (Murmur3 64-bit finalizer)
-     */
-    inline size_t compute_hash(const uint64_t* kmer_data) const {
-        size_t hash = kmer_data[0];
-        for (size_t i = 1; i < WORDS; ++i) {
-            hash ^= kmer_data[i];
-        }
-        hash ^= hash >> 33;
-        hash *= 0xff51afd7ed558ccdULL;
-        hash ^= hash >> 33;
-        hash *= 0xc4ceb9fe1a85ec53ULL;
-        hash ^= hash >> 33;
-        return hash;
-    }
-
-    /**
-     * @brief Compare k-mers for equality (unrolled for small WORDS)
-     */
-    inline bool kmers_equal(const uint64_t* a, const uint64_t* b) const {
-        if constexpr (WORDS == 1) {
-            return a[0] == b[0];
-        } else if constexpr (WORDS == 2) {
-            return a[0] == b[0] && a[1] == b[1];
-        } else {
-            for (size_t i = 0; i < WORDS; ++i) {
-                if (a[i] != b[i]) return false;
-            }
-            return true;
-        }
-    }
-
-    /**
-     * @brief Compute probe distance for Robin Hood hashing
-     */
-    inline size_t probe_distance(size_t slot, size_t hash) const {
-        return (slot - hash) & mask_;
-    }
-
-    /**
-     * @brief Insert or increment k-mer count using Robin Hood hashing
-     *
-     * Robin Hood hashing maintains O(1) average lookup even at 90%+ load
-     * by "stealing" slots from entries with shorter probe distances.
-     */
-    void insert_or_increment(const uint64_t* kmer_data, Transform transform) {
-        size_t hash = compute_hash(kmer_data);
-        size_t pos = hash & mask_;
-        size_t dist = 0;
-
-        // Entry to potentially insert (only populated if we need to insert new)
-        Entry to_insert;
-        bool inserting_new = false;
-        Transform insert_transform = transform;
-
-        __builtin_prefetch(&entries_[pos], 1, 3);
-
-        while (true) {
-            Entry& slot = entries_[pos];
-
-            if (dist < 8) {
-                __builtin_prefetch(&entries_[(pos + 2) & mask_], 1, 2);
-            }
-
-            if (slot.is_empty()) {
-                if (inserting_new) {
-                    // Place the displaced entry
-                    slot = to_insert;
-                } else {
-                    // Insert new k-mer
-                    copy_kmer(slot.kmer, kmer_data);
-                    slot.count_I = slot.count_R = slot.count_C = slot.count_RC = 0;
-                    increment_compact_count(slot, transform);
-                    ++entry_count_;
-                }
-                return;
-            }
-
-            if (!inserting_new && kmers_equal(slot.kmer, kmer_data)) {
-                // Found existing k-mer, increment count
-                increment_compact_count(slot, transform);
-                return;
-            }
-
-            // Robin Hood: check if we should swap
-            size_t slot_hash = compute_hash(slot.kmer);
-            size_t slot_dist = probe_distance(pos, slot_hash);
-
-            if (slot_dist < dist) {
-                // Current entry has traveled less than us - swap (Robin Hood)
-                if (!inserting_new) {
-                    // First time swapping - create entry for the new k-mer
-                    copy_kmer(to_insert.kmer, kmer_data);
-                    to_insert.count_I = to_insert.count_R = to_insert.count_C = to_insert.count_RC = 0;
-                    increment_compact_count(to_insert, transform);
-                    inserting_new = true;
-                    ++entry_count_;
-                }
-
-                // Swap with current slot
-                Entry tmp = slot;
-                slot = to_insert;
-                to_insert = tmp;
-                dist = slot_dist;
-            }
-
-            pos = (pos + 1) & mask_;
-            ++dist;
-
-            // Safety check (should never trigger with proper load factor)
-            if (dist > capacity_) {
-                std::cerr << "Error: Hash table full (probe distance exceeded capacity)\n";
-                exit(1);
-            }
-        }
-    }
-
-private:
-    inline void copy_kmer(uint64_t* dst, const uint64_t* src) {
-        if constexpr (WORDS == 1) {
-            dst[0] = src[0];
-        } else if constexpr (WORDS == 2) {
-            dst[0] = src[0];
-            dst[1] = src[1];
-        } else {
-            for (size_t i = 0; i < WORDS; ++i) {
-                dst[i] = src[i];
-            }
-        }
-    }
-
-    inline void increment_compact_count(Entry& entry, Transform transform) {
-        uint8_t* count_ptr = nullptr;
-        switch (transform) {
-            case TRANSFORM_I:  count_ptr = &entry.count_I;  break;
-            case TRANSFORM_R:  count_ptr = &entry.count_R;  break;
-            case TRANSFORM_C:  count_ptr = &entry.count_C;  break;
-            case TRANSFORM_RC: count_ptr = &entry.count_RC; break;
-        }
-
-        if (*count_ptr < OVERFLOW_MARKER) {
-            // Normal case: increment 8-bit counter (0 -> 254)
-            ++(*count_ptr);
-        } else {
-            // Already at overflow marker (255) - use overflow table
-            increment_overflow(entry.kmer, transform);
-        }
-    }
-
-    void increment_overflow(const uint64_t* kmer_data, Transform transform) {
-        OverflowKey key;
-        copy_kmer(key.kmer, kmer_data);
-
-        auto& counts = overflow_table_[key];
-        switch (transform) {
-            case TRANSFORM_I:  ++counts.count_I;  break;
-            case TRANSFORM_R:  ++counts.count_R;  break;
-            case TRANSFORM_C:  ++counts.count_C;  break;
-            case TRANSFORM_RC: ++counts.count_RC; break;
-        }
-    }
+    std::deque<InputJob> jobs_;
+    const size_t capacity_;
+    std::mutex mutex_;
+    std::condition_variable not_empty_;
+    std::condition_variable not_full_;
+    bool closed_ = false;
+    bool cancelled_ = false;
+    std::atomic<uint64_t> wait_ns_{0};
 
 public:
-    /**
-     * @brief Get the full count for a transform, handling overflow
-     */
-    uint64_t get_count(const Entry& entry, Transform transform) const {
-        uint8_t compact;
-        switch (transform) {
-            case TRANSFORM_I:  compact = entry.count_I;  break;
-            case TRANSFORM_R:  compact = entry.count_R;  break;
-            case TRANSFORM_C:  compact = entry.count_C;  break;
-            case TRANSFORM_RC: compact = entry.count_RC; break;
-            default: return 0;
-        }
+    explicit JobQueue(size_t capacity) : capacity_(std::max<size_t>(capacity, 1)) {}
 
-        if (compact < OVERFLOW_MARKER) {
-            return compact;
-        }
-
-        // Look up in overflow table (count >= 255)
-        OverflowKey key;
-        for (size_t i = 0; i < WORDS; ++i) {
-            key.kmer[i] = entry.kmer[i];
-        }
-
-        auto it = overflow_table_.find(key);
-        if (it == overflow_table_.end()) {
-            return OVERFLOW_MARKER;  // Shouldn't happen, but safe fallback
-        }
-
-        // Return 255 (marker) + overflow count
-        switch (transform) {
-            case TRANSFORM_I:  return OVERFLOW_MARKER + it->second.count_I;
-            case TRANSFORM_R:  return OVERFLOW_MARKER + it->second.count_R;
-            case TRANSFORM_C:  return OVERFLOW_MARKER + it->second.count_C;
-            case TRANSFORM_RC: return OVERFLOW_MARKER + it->second.count_RC;
-            default: return 0;
-        }
-    }
-
-    size_t size() const { return entry_count_; }
-    size_t overflow_size() const { return overflow_table_.size(); }
-    double load_factor() const { return static_cast<double>(entry_count_) / capacity_; }
-
-    // Iterator support
-    class Iterator {
-        const CompactHashTable* table_;
-        size_t index_;
-        void skip_empty() {
-            while (index_ < table_->capacity_ && table_->entries_[index_].is_empty()) ++index_;
-        }
-    public:
-        Iterator(const CompactHashTable* t, size_t i) : table_(t), index_(i) { skip_empty(); }
-        bool operator!=(const Iterator& o) const { return index_ != o.index_; }
-        Iterator& operator++() { ++index_; skip_empty(); return *this; }
-        const Entry& operator*() const { return table_->entries_[index_]; }
-    };
-
-    Iterator begin() const { return Iterator(this, 0); }
-    Iterator end() const { return Iterator(this, capacity_); }
-};
-
-// ============================================================================
-// COMPACT PACKED KMER (Template-based)
-// ============================================================================
-
-template<size_t WORDS>
-class CompactKmer {
-private:
-    uint64_t data_[WORDS];
-
-public:
-    CompactKmer() { clear(); }
-
-    void clear() {
-        if constexpr (WORDS == 1) {
-            data_[0] = 0;
-        } else if constexpr (WORDS == 2) {
-            data_[0] = 0;
-            data_[1] = 0;
-        } else {
-            for (size_t i = 0; i < WORDS; ++i) data_[i] = 0;
-        }
-    }
-
-    uint64_t* data() { return data_; }
-    const uint64_t* data() const { return data_; }
-
-    bool operator<(const CompactKmer& other) const {
-        for (size_t i = 0; i < WORDS; ++i) {
-            if (data_[i] != other.data_[i]) return data_[i] < other.data_[i];
-        }
-        return false;
-    }
-};
-
-/**
- * @brief Result of canonical form computation
- * Contains both the canonical k-mer and which transform was applied
- */
-template<size_t WORDS>
-struct CanonicalResult {
-    CompactKmer<WORDS> kmer;
-    Transform transform;
-};
-
-// ============================================================================
-// COMPACT DUAL ROLLING WINDOW
-// ============================================================================
-
-template<size_t WORDS>
-class CompactRollingWindow {
-private:
-    size_t k_;
-    CompactKmer<WORDS> forward_;
-    CompactKmer<WORDS> reverse_complement_;
-    size_t bases_in_window_;
-    uint64_t high_word_mask_;
-    uint64_t complement_mask_[WORDS];  // Mask for XOR complement
-
-public:
-    explicit CompactRollingWindow(size_t k) : k_(k), bases_in_window_(0) {
-        size_t used_bits = (2 * k) % 64;
-        high_word_mask_ = (used_bits == 0) ? ~0ULL : ((1ULL << used_bits) - 1);
-
-        // Initialize complement mask: all 1s in the 2*k bits used for k-mer storage
-        // XOR with this mask computes DNA complement: A(00)↔T(11), C(01)↔G(10)
-        size_t total_bits = 2 * k;
-        for (size_t w = 0; w < WORDS; ++w) {
-            size_t bits_in_word = (total_bits >= 64) ? 64 : total_bits;
-            complement_mask_[w] = (bits_in_word == 64) ? ~0ULL : ((1ULL << bits_in_word) - 1);
-            total_bits = (total_bits > 64) ? total_bits - 64 : 0;
-        }
-    }
-
-    void reset() {
-        forward_.clear();
-        reverse_complement_.clear();
-        bases_in_window_ = 0;
-    }
-
-    bool add_base(uint8_t base) {
-        uint8_t complement = 3 - base;
-
-        if (bases_in_window_ < k_) {
-            size_t fwd_bit = 2 * bases_in_window_;
-            size_t fwd_word = fwd_bit >> 6;
-            size_t fwd_offset = fwd_bit & 63;
-            forward_.data()[fwd_word] |= static_cast<uint64_t>(base) << fwd_offset;
-
-            size_t rc_bit = 2 * (k_ - 1 - bases_in_window_);
-            size_t rc_word = rc_bit >> 6;
-            size_t rc_offset = rc_bit & 63;
-            reverse_complement_.data()[rc_word] |= static_cast<uint64_t>(complement) << rc_offset;
-
-            ++bases_in_window_;
-            return bases_in_window_ == k_;
-        }
-
-        uint64_t* fwd = forward_.data();
-        uint64_t* rc = reverse_complement_.data();
-
-        // Forward: shift right by 2
-        if constexpr (WORDS == 1) {
-            fwd[0] >>= 2;
-        } else {
-            for (size_t i = 0; i < WORDS; ++i) {
-                fwd[i] >>= 2;
-                if (i + 1 < WORDS) fwd[i] |= (fwd[i + 1] & 3) << 62;
-            }
-        }
-
-        size_t high_bit = 2 * (k_ - 1);
-        size_t high_word = high_bit >> 6;
-        size_t high_offset = high_bit & 63;
-        fwd[high_word] = (fwd[high_word] & ~(3ULL << high_offset)) | (static_cast<uint64_t>(base) << high_offset);
-        fwd[WORDS - 1] &= high_word_mask_;
-
-        // Reverse complement: shift left by 2
-        if constexpr (WORDS == 1) {
-            rc[0] <<= 2;
-            rc[0] = (rc[0] & ~3ULL) | complement;
-        } else {
-            for (size_t i = WORDS; i > 0; --i) {
-                size_t idx = i - 1;
-                rc[idx] <<= 2;
-                if (idx > 0) rc[idx] |= (rc[idx - 1] >> 62) & 3;
-            }
-            rc[0] = (rc[0] & ~3ULL) | complement;
-        }
-        rc[WORDS - 1] &= high_word_mask_;
-
+    bool push(InputJob job) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        const auto wait_start = std::chrono::steady_clock::now();
+        not_full_.wait(lock, [this] {
+            return jobs_.size() < capacity_ || cancelled_;
+        });
+        wait_ns_.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - wait_start).count()), std::memory_order_relaxed);
+        if (cancelled_) return false;
+        jobs_.push_back(std::move(job));
+        not_empty_.notify_one();
         return true;
     }
 
-    /**
-     * @brief Compute DNA complement using XOR
-     *
-     * DNA complement swaps bases: A(00) ↔ T(11), C(01) ↔ G(10)
-     * This is equivalent to XOR with 0b11 for each 2-bit base,
-     * i.e., XOR with a mask of all 1s in the used bit positions.
-     *
-     * Time complexity: O(WORDS) - very fast!
-     */
-    CompactKmer<WORDS> compute_complement(const CompactKmer<WORDS>& kmer) const {
-        CompactKmer<WORDS> result;
-        if constexpr (WORDS == 1) {
-            result.data()[0] = kmer.data()[0] ^ complement_mask_[0];
-        } else if constexpr (WORDS == 2) {
-            result.data()[0] = kmer.data()[0] ^ complement_mask_[0];
-            result.data()[1] = kmer.data()[1] ^ complement_mask_[1];
-        } else {
-            for (size_t i = 0; i < WORDS; ++i) {
-                result.data()[i] = kmer.data()[i] ^ complement_mask_[i];
-            }
-        }
-        return result;
+    bool pop(InputJob& job) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        const auto wait_start = std::chrono::steady_clock::now();
+        not_empty_.wait(lock, [this] {
+            return !jobs_.empty() || closed_ || cancelled_;
+        });
+        wait_ns_.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - wait_start).count()), std::memory_order_relaxed);
+        if (cancelled_ || jobs_.empty()) return false;
+        job = std::move(jobs_.front());
+        jobs_.pop_front();
+        not_full_.notify_one();
+        return true;
     }
 
-    /**
-     * @brief Compare two k-mers lexicographically
-     * @return negative if a < b, 0 if equal, positive if a > b
-     */
-    inline int compare_kmers(const uint64_t* a, const uint64_t* b) const {
-        if constexpr (WORDS == 1) {
-            return (a[0] < b[0]) ? -1 : ((a[0] > b[0]) ? 1 : 0);
-        } else if constexpr (WORDS == 2) {
-            if (a[0] != b[0]) return (a[0] < b[0]) ? -1 : 1;
-            return (a[1] < b[1]) ? -1 : ((a[1] > b[1]) ? 1 : 0);
-        } else {
-            for (size_t i = 0; i < WORDS; ++i) {
-                if (a[i] != b[i]) return (a[i] < b[i]) ? -1 : 1;
+    void close() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        closed_ = true;
+        not_empty_.notify_all();
+    }
+
+    void cancel() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        cancelled_ = true;
+        jobs_.clear();
+        not_empty_.notify_all();
+        not_full_.notify_all();
+    }
+
+    uint64_t wait_ns() const { return wait_ns_.load(std::memory_order_relaxed); }
+};
+
+class ProcessingCancelled : public std::exception {};
+
+bool is_repetitive_job(const std::string& job) {
+    static constexpr size_t SAMPLE_COUNT = 64;
+    static constexpr size_t SIGNATURE_BASES = 16;
+    static constexpr size_t DUPLICATE_THRESHOLD = 8;
+    if (job.size() < 4096 || job.size() < SIGNATURE_BASES) return false;
+
+    std::array<uint32_t, SAMPLE_COUNT> signatures{};
+    size_t duplicates = 0;
+    const size_t last_start = job.size() - SIGNATURE_BASES;
+    for (size_t sample = 0; sample < SAMPLE_COUNT; ++sample) {
+        const size_t start = (sample * last_start) / (SAMPLE_COUNT - 1);
+        uint32_t signature = 0;
+        for (size_t base = 0; base < SIGNATURE_BASES; ++base) {
+            signature = (signature << 2) |
+                        static_cast<unsigned char>(job[start + base]);
+        }
+        for (size_t previous = 0; previous < sample; ++previous) {
+            if (signatures[previous] == signature) {
+                ++duplicates;
+                break;
             }
-            return 0;
+        }
+        if (duplicates >= DUPLICATE_THRESHOLD) return true;
+        signatures[sample] = signature;
+    }
+    return false;
+}
+
+class RawOutputFile {
+private:
+    FILE* file_ = nullptr;
+
+public:
+    explicit RawOutputFile(const std::string& filename) {
+        file_ = fopen(filename.c_str(), "wb");
+        if (!file_) {
+            throw std::runtime_error("Cannot open output file: " + filename +
+                                     ": " + std::strerror(errno));
         }
     }
 
-    /**
-     * @brief Get canonical form and transform using Klein four-group V₄ (zero-copy optimized)
-     *
-     * Uses the Klein four-group V₄ = {I, R, C, RC} to find the canonical form.
-     * Optimized to minimize copies: computes C and R lazily, only copies the winner.
-     *
-     * @return CanonicalResult with canonical k-mer and applied transform
-     */
-    CanonicalResult<WORDS> get_canonical() const {
-        CanonicalResult<WORDS> result;
+    ~RawOutputFile() {
+        if (file_) fclose(file_);
+    }
 
-        // Start with forward (I) as candidate
-        const uint64_t* best = forward_.data();
-        result.transform = TRANSFORM_I;
+    RawOutputFile(const RawOutputFile&) = delete;
+    RawOutputFile& operator=(const RawOutputFile&) = delete;
 
-        // Compare against RC (already maintained)
-        if (compare_kmers(reverse_complement_.data(), best) < 0) {
-            best = reverse_complement_.data();
-            result.transform = TRANSFORM_RC;
+    void write(const std::string& block) {
+        if (fwrite(block.data(), 1, block.size(), file_) != block.size()) {
+            throw std::runtime_error("Error writing output file");
         }
+    }
 
-        // Compute C = complement(F) and compare
-        CompactKmer<WORDS> complement_of_F = compute_complement(forward_);
-        if (compare_kmers(complement_of_F.data(), best) < 0) {
-            best = complement_of_F.data();
-            result.transform = TRANSFORM_C;
+    void close() {
+        FILE* file = file_;
+        file_ = nullptr;
+        if (fclose(file) != 0) {
+            throw std::runtime_error("Error closing output file");
         }
-
-        // Compute R = complement(RC) and compare
-        CompactKmer<WORDS> reverse_of_F = compute_complement(reverse_complement_);
-        if (compare_kmers(reverse_of_F.data(), best) < 0) {
-            best = reverse_of_F.data();
-            result.transform = TRANSFORM_R;
-        }
-
-        // Copy only the winner
-        if constexpr (WORDS == 1) {
-            result.kmer.data()[0] = best[0];
-        } else if constexpr (WORDS == 2) {
-            result.kmer.data()[0] = best[0];
-            result.kmer.data()[1] = best[1];
-        } else {
-            for (size_t i = 0; i < WORDS; ++i) {
-                result.kmer.data()[i] = best[i];
-            }
-        }
-
-        return result;
     }
 };
 
-// ============================================================================
-// BUFFERED READER (Supports plain and gzip files)
-// ============================================================================
-
-class BufferedReader {
+class SequenceChunker {
 private:
-    static constexpr size_t BUFFER_SIZE = 16 * 1024 * 1024;  // 16MB
-    std::vector<char> buffer_;
-    size_t pos_ = 0;
-    size_t valid_ = 0;
-    gzFile gz_file_ = nullptr;
-    FILE* plain_file_ = nullptr;
-    CompressionType compression_;
-    bool eof_ = false;
+    JobQueue& queue_;
+    const size_t k_;
+    std::string run_;
 
-    void fill_buffer() {
-        if (eof_) return;
-
-        if (compression_ == CompressionType::GZIP) {
-            int bytes_read = gzread(gz_file_, buffer_.data(), BUFFER_SIZE);
-            if (bytes_read < 0) {
-                throw std::runtime_error("Error reading gzip file");
-            }
-            valid_ = static_cast<size_t>(bytes_read);
-            if (bytes_read == 0) {
-                eof_ = true;
-            }
-        } else {
-            size_t bytes_read = fread(buffer_.data(), 1, BUFFER_SIZE, plain_file_);
-            valid_ = bytes_read;
-            if (bytes_read == 0) {
-                eof_ = true;
-            }
-        }
-        pos_ = 0;
+    void enqueue(std::string job) {
+        if (!queue_.push(InputJob{std::move(job), 0, false})) throw ProcessingCancelled();
     }
 
 public:
-    BufferedReader(const std::string& filename, CompressionType comp)
-        : buffer_(BUFFER_SIZE), compression_(comp) {
+    SequenceChunker(JobQueue& queue, size_t k) : queue_(queue), k_(k) {
+        run_.reserve(WINDOWS_PER_JOB + k - 1);
+    }
 
-        if (compression_ == CompressionType::GZIP) {
-            gz_file_ = gzopen(filename.c_str(), "rb");
-            if (!gz_file_) {
-                throw std::runtime_error("Cannot open gzip file: " + filename);
+    void add_base(uint8_t encoded) {
+        run_.push_back(static_cast<char>(encoded));
+        const size_t job_size = WINDOWS_PER_JOB + k_ - 1;
+        if (run_.size() == job_size) {
+            std::string overlap;
+            if (k_ > 1) {
+                overlap.assign(run_.end() - static_cast<std::ptrdiff_t>(k_ - 1),
+                               run_.end());
             }
-            gzbuffer(gz_file_, BUFFER_SIZE);
-        } else {
-            plain_file_ = fopen(filename.c_str(), "rb");
-            if (!plain_file_) {
-                throw std::runtime_error("Cannot open file: " + filename);
-            }
-        }
-
-        fill_buffer();
-    }
-
-    ~BufferedReader() {
-        if (gz_file_) gzclose(gz_file_);
-        if (plain_file_) fclose(plain_file_);
-    }
-
-    BufferedReader(const BufferedReader&) = delete;
-    BufferedReader& operator=(const BufferedReader&) = delete;
-
-    int peek() {
-        if (pos_ >= valid_) {
-            fill_buffer();
-            if (eof_) return EOF;
-        }
-        return static_cast<unsigned char>(buffer_[pos_]);
-    }
-
-    int get() {
-        if (pos_ >= valid_) {
-            fill_buffer();
-            if (eof_) return EOF;
-        }
-        return static_cast<unsigned char>(buffer_[pos_++]);
-    }
-
-    void skip_line() {
-        int c;
-        while ((c = get()) != '\n' && c != EOF) {
-            // Skip until newline or EOF
+            enqueue(std::move(run_));
+            run_ = std::move(overlap);
+            run_.reserve(job_size);
         }
     }
 
-    bool eof() const { return eof_ && pos_ >= valid_; }
+    void break_run() {
+        if (run_.size() >= k_) enqueue(std::move(run_));
+        run_.clear();
+        run_.reserve(WINDOWS_PER_JOB + k_ - 1);
+    }
+
+    void finish() { break_run(); }
 };
 
-// ============================================================================
-// FORMAT/COMPRESSION DETECTION
-// ============================================================================
-
-CompressionType detect_compression(const std::string& filename) {
-    if (filename.size() >= 3 && filename.substr(filename.size() - 3) == ".gz") {
-        return CompressionType::GZIP;
-    }
-    return CompressionType::NONE;
-}
-
-FileFormat detect_format(BufferedReader& reader) {
-    int c = reader.peek();
-    if (c == '>') return FileFormat::FASTA;
-    if (c == '@') return FileFormat::FASTQ;
-    throw std::runtime_error("Unknown file format: expected '>' (FASTA) or '@' (FASTQ)");
-}
-
-// ============================================================================
-// SEQUENCE READER (Unified FASTA/FASTQ interface)
-// ============================================================================
-
-class SequenceReader {
+class ParallelSequenceReader {
 private:
     std::string filename_;
     CompressionType compression_;
     FileFormat format_;
 
-public:
-    explicit SequenceReader(const std::string& filename)
-        : filename_(filename) {
-        compression_ = detect_compression(filename);
+    void produce_fasta(BufferedReader& reader, SequenceChunker& chunker) {
+        bool in_header = false;
+        bool at_line_start = true;
+        int c;
+        while ((c = reader.get()) != EOF) {
+            if (in_header) {
+                if (c == '\n') {
+                    in_header = false;
+                    at_line_start = true;
+                }
+                continue;
+            }
+            if (c == '\n') {
+                at_line_start = true;
+                continue;
+            }
+            if (c == '\r' || c == ' ' || c == '\t') continue;
+            if (at_line_start && (c == '>' || c == ';')) {
+                in_header = true;
+                if (c == '>') chunker.break_run();
+                continue;
+            }
 
-        // Open briefly to detect format
-        BufferedReader reader(filename, compression_);
+            at_line_start = false;
+            const int8_t code = BASE_ENCODING[static_cast<unsigned char>(c)];
+            if (code >= 0) {
+                chunker.add_base(static_cast<uint8_t>(code));
+            } else {
+                chunker.break_run();
+            }
+        }
+        chunker.finish();
+    }
+
+    void produce_plain_fasta(size_t k, JobQueue& queue) {
+        std::ifstream input(filename_);
+        if (!input) throw std::runtime_error("Cannot open file: " + filename_);
+        const size_t overlap_limit = k - 1 + 1024;
+        std::string pending;
+        std::string overlap;
+        pending.reserve(WINDOWS_PER_JOB + overlap_limit);
+        std::string line;
+        while (std::getline(input, line)) {
+            pending.append(line);
+            pending.push_back(10);
+            if (pending.size() < WINDOWS_PER_JOB) continue;
+            InputJob job;
+            job.bytes = overlap + pending;
+            job.emit_from = overlap.size();
+            job.raw_fasta = true;
+            if (!queue.push(std::move(job))) throw ProcessingCancelled();
+            size_t keep_start = pending.size() > overlap_limit
+                                    ? pending.size() - overlap_limit
+                                    : 0;
+            while (keep_start > 0 && pending[keep_start - 1] != 10) --keep_start;
+            overlap.assign(pending, keep_start, std::string::npos);
+            pending.clear();
+        }
+        if (input.bad()) throw std::runtime_error("Error reading file: " + filename_);
+        if (!pending.empty()) {
+            InputJob job;
+            job.bytes = overlap + pending;
+            job.emit_from = overlap.size();
+            job.raw_fasta = true;
+            if (!queue.push(std::move(job))) throw ProcessingCancelled();
+        }
+    }
+
+    void produce_fastq(BufferedReader& reader, SequenceChunker& chunker) {
+        while (!reader.eof()) {
+            int c = reader.peek();
+            while (c == '\n' || c == '\r') {
+                reader.get();
+                c = reader.peek();
+            }
+            if (c == EOF) break;
+            if (c != '@') {
+                throw std::runtime_error("Malformed FASTQ: expected '@' header");
+            }
+
+            reader.skip_line();
+            chunker.break_run();
+            size_t sequence_length = 0;
+
+            while (true) {
+                c = reader.peek();
+                if (c == EOF) {
+                    throw std::runtime_error("Malformed FASTQ: missing '+' line");
+                }
+                if (c == '+') {
+                    reader.skip_line();
+                    chunker.break_run();
+                    break;
+                }
+
+                while ((c = reader.get()) != '\n' && c != EOF) {
+                    if (c == '\r') continue;
+                    if (sequence_length == std::numeric_limits<size_t>::max()) {
+                        throw std::length_error("FASTQ sequence is too long");
+                    }
+                    ++sequence_length;
+                    const int8_t code =
+                        BASE_ENCODING[static_cast<unsigned char>(c)];
+                    if (code >= 0) {
+                        chunker.add_base(static_cast<uint8_t>(code));
+                    } else {
+                        chunker.break_run();
+                    }
+                }
+                if (c == EOF) {
+                    throw std::runtime_error("Malformed FASTQ: missing '+' line");
+                }
+            }
+
+            size_t quality_length = 0;
+            while (quality_length < sequence_length) {
+                c = reader.get();
+                if (c == EOF) {
+                    throw std::runtime_error(
+                        "Malformed FASTQ: truncated quality data");
+                }
+                if (c != '\n' && c != '\r') ++quality_length;
+            }
+
+            c = reader.peek();
+            while (c == '\r') {
+                reader.get();
+                c = reader.peek();
+            }
+            if (c == '\n') {
+                reader.get();
+            } else if (c != EOF) {
+                throw std::runtime_error(
+                    "Malformed FASTQ: quality length exceeds sequence length");
+            }
+        }
+        chunker.finish();
+    }
+
+public:
+    explicit ParallelSequenceReader(const std::string& filename)
+        : filename_(filename), compression_(detect_compression(filename)) {
+        BufferedReader reader(filename_, compression_);
         format_ = detect_format(reader);
     }
 
     FileFormat format() const { return format_; }
     CompressionType compression() const { return compression_; }
 
-    template<size_t WORDS>
-    void count_kmers(size_t k, CompactHashTable<WORDS>& table) {
+    void produce(size_t k, JobQueue& queue) {
+        if (compression_ == CompressionType::NONE && format_ == FileFormat::FASTA) {
+            produce_plain_fasta(k, queue);
+            return;
+        }
         BufferedReader reader(filename_, compression_);
-
+        SequenceChunker chunker(queue, k);
         if (format_ == FileFormat::FASTA) {
-            count_fasta<WORDS>(reader, k, table);
+            produce_fasta(reader, chunker);
         } else {
-            count_fastq<WORDS>(reader, k, table);
-        }
-    }
-
-private:
-    template<size_t WORDS>
-    void count_fasta(BufferedReader& reader, size_t k, CompactHashTable<WORDS>& table) {
-        CompactRollingWindow<WORDS> window(k);
-        bool in_header = false;
-
-        int c;
-        while ((c = reader.get()) != EOF) {
-            if (c == '>') {
-                in_header = true;
-                window.reset();
-            } else if (c == '\n') {
-                in_header = false;
-            } else if (!in_header) {
-                int8_t code = BASE_ENCODING[static_cast<unsigned char>(c)];
-                if (code >= 0) {
-                    if (window.add_base(static_cast<uint8_t>(code))) {
-                        auto canonical = window.get_canonical();
-                        table.insert_or_increment(canonical.kmer.data(), canonical.transform);
-                    }
-                } else {
-                    window.reset();
-                }
-            }
-        }
-    }
-
-    template<size_t WORDS>
-    void count_fastq(BufferedReader& reader, size_t k, CompactHashTable<WORDS>& table) {
-        CompactRollingWindow<WORDS> window(k);
-
-        // FASTQ format: 4 lines per record
-        // Line 1: @header
-        // Line 2: sequence
-        // Line 3: +
-        // Line 4: quality scores
-
-        while (!reader.eof()) {
-            int c = reader.peek();
-            if (c == EOF) break;
-
-            // Skip any blank lines or unexpected characters
-            if (c != '@') {
-                reader.skip_line();
-                continue;
-            }
-
-            // Line 1: Skip header line
-            reader.skip_line();
-
-            // Line 2: Process sequence line
-            while ((c = reader.get()) != '\n' && c != EOF) {
-                int8_t code = BASE_ENCODING[static_cast<unsigned char>(c)];
-                if (code >= 0) {
-                    if (window.add_base(static_cast<uint8_t>(code))) {
-                        auto canonical = window.get_canonical();
-                        table.insert_or_increment(canonical.kmer.data(), canonical.transform);
-                    }
-                } else {
-                    window.reset();
-                }
-            }
-
-            // Line 3: Skip + line
-            reader.skip_line();
-
-            // Line 4: Skip quality line
-            reader.skip_line();
-
-            // Reset window between reads (each read is independent)
-            window.reset();
+            produce_fastq(reader, chunker);
         }
     }
 };
 
-// ============================================================================
-// UTILITY FUNCTIONS
-// ============================================================================
-
-std::string kmer_to_string(const uint64_t* kmer_data, size_t k) {
-    std::string result;
-    result.reserve(k);
-    for (size_t i = 0; i < k; ++i) {
-        size_t bit_pos = 2 * i;
-        size_t word = bit_pos >> 6;
-        size_t offset = bit_pos & 63;
-        uint8_t base = (kmer_data[word] >> offset) & 3;
-        result += BASE_DECODING[base];
-    }
-    return result;
-}
-
-/**
- * @brief Compute complement of a k-mer (XOR with all-1s mask)
- */
 template<size_t WORDS>
-CompactKmer<WORDS> compute_complement_kmer(const CompactKmer<WORDS>& kmer, size_t k) {
-    CompactKmer<WORDS> result;
-    size_t total_bits = 2 * k;
-    for (size_t w = 0; w < WORDS; ++w) {
-        size_t bits_in_word = (total_bits >= 64) ? 64 : total_bits;
-        uint64_t mask = (bits_in_word == 64) ? ~0ULL : ((1ULL << bits_in_word) - 1);
-        result.data()[w] = kmer.data()[w] ^ mask;
-        total_bits = (total_bits > 64) ? total_bits - 64 : 0;
+class ShardedV4Table {
+public:
+    struct PendingUpdate {
+        std::array<uint64_t, WORDS> kmer{};
+        Transform transform = TRANSFORM_I;
+        uint32_t count = 1;
+        size_t hash = 0;
+    };
+
+    struct __attribute__((packed)) OutputRecord {
+        // kmer is already in the rendered lexicographic orientation.
+        std::array<uint64_t, WORDS> kmer{};
+        uint64_t count = 0;
+    };
+
+    struct WorkerBuffers {
+        std::vector<std::vector<PendingUpdate>> updates;
+        explicit WorkerBuffers(size_t shard_count) : updates(shard_count) {}
+        size_t pending_count = 0;
+    };
+
+private:
+    using Table = CompactHashTable<WORDS>;
+
+    struct alignas(64) Shard {
+        std::mutex mutex;
+        std::unique_ptr<Table> table;
+    };
+
+    std::array<Shard, MAX_SHARD_COUNT> shards_;
+    size_t shard_count_;
+    unsigned shard_bits_;
+    std::atomic<uint64_t>* mutex_wait_ns_ = nullptr;
+
+    static constexpr unsigned compute_shard_bits(size_t count) {
+        unsigned bits = 0;
+        while (count > 1) {
+            ++bits;
+            count >>= 1;
+        }
+        return bits;
     }
-    return result;
+
+    size_t shard_index(size_t hash) const {
+        return static_cast<size_t>(hash >> (64 - shard_bits_));
+    }
+
+    static bool keys_equal(const uint64_t* left, const uint64_t* right) {
+        for (size_t word = 0; word < WORDS; ++word) {
+            if (left[word] != right[word]) return false;
+        }
+        return true;
+    }
+
+    static std::array<uint64_t, WORDS> make_output_kmer(
+        const uint64_t* canonical, size_t k, OutputTransform transform) {
+        std::array<uint64_t, WORDS> rendered{};
+        for (size_t position = 0; position < k; ++position) {
+            const size_t source =
+                transform == OutputTransform::REVERSE ? k - 1 - position : position;
+            uint8_t base = encoded_base(canonical, source);
+            if (transform == OutputTransform::COMPLEMENT) base ^= 3;
+            const size_t word = position >> 5;
+            const size_t offset = (position & 31) << 1;
+            rendered[word] |= static_cast<uint64_t>(base) << offset;
+        }
+        return rendered;
+    }
+
+    template<bool BULK>
+    void flush(size_t index, WorkerBuffers& buffers) {
+        auto& updates = buffers.updates[index];
+        if (updates.empty()) return;
+        Shard& shard = shards_[index];
+        const auto wait_start = std::chrono::steady_clock::now();
+        std::unique_lock<std::mutex> lock(shard.mutex);
+        if (mutex_wait_ns_ != nullptr) {
+            mutex_wait_ns_->fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - wait_start).count()), std::memory_order_relaxed);
+        }
+        for (const PendingUpdate& update : updates) {
+            if constexpr (!BULK) {
+                shard.table->insert_or_add_hashed(update.kmer.data(),
+                                                  update.transform, 1,
+                                                  update.hash);
+            } else {
+                shard.table->insert_or_add_hashed(update.kmer.data(),
+                                                  update.transform,
+                                                  update.count, update.hash);
+            }
+        }
+        buffers.pending_count -= updates.size();
+        updates.clear();
+    }
+
+    static void append_output_line(std::string& block,
+                                   const uint64_t* kmer_data, size_t k,
+                                   OutputTransform transform, uint64_t count) {
+        for (size_t i = 0; i < k; ++i) {
+            const size_t source = transform == OutputTransform::REVERSE ? k - 1 - i : i;
+            uint8_t base = encoded_base(kmer_data, source);
+            if (transform == OutputTransform::COMPLEMENT) base ^= 3;
+            block.push_back(BASE_DECODING[base]);
+        }
+        block.push_back(9);
+        char count_buffer[32];
+        const auto conversion = std::to_chars(count_buffer, count_buffer + sizeof(count_buffer), count);
+        if (conversion.ec != std::errc()) throw std::runtime_error("Cannot format k-mer count");
+        block.append(count_buffer, conversion.ptr);
+        block.push_back(10);
+    }
+
+    void format_shard(size_t index, size_t k,
+                      std::vector<std::vector<std::string>>& output_blocks,
+                      std::mutex& output_mutex,
+                      std::atomic<size_t>& output_lines) const {
+        const Table& table = *shards_[index].table;
+        std::vector<std::string> lines;
+        lines.reserve(table.size() * 2);
+        size_t local_lines = 0;
+        for (const auto& entry : table) {
+            CompactKmer<WORDS> canonical;
+            for (size_t word = 0; word < WORDS; ++word) canonical.data()[word] = entry.kmer[word];
+            const uint64_t count_I = table.get_count(entry, TRANSFORM_I);
+            const uint64_t count_R = table.get_count(entry, TRANSFORM_R);
+            const uint64_t count_C = table.get_count(entry, TRANSFORM_C);
+            const uint64_t count_RC = table.get_count(entry, TRANSFORM_RC);
+            const uint64_t count_pair1 = count_I + count_RC;
+            const uint64_t count_pair2 = count_R + count_C;
+            if (count_pair1 > 0) {
+                std::string line;
+                append_output_line(line, canonical.data(), k, OutputTransform::IDENTITY, count_pair1);
+                lines.push_back(std::move(line));
+                ++local_lines;
+            }
+            if (count_pair2 > 0) {
+                const OutputTransform pair_transform = reverse_is_canonical_pair_member(canonical.data(), k) ? OutputTransform::REVERSE : OutputTransform::COMPLEMENT;
+                std::string line;
+                append_output_line(line, canonical.data(), k, pair_transform, count_pair2);
+                lines.push_back(std::move(line));
+                ++local_lines;
+            }
+        }
+        std::sort(lines.begin(), lines.end());
+        std::string block;
+        block.reserve(OUTPUT_BLOCK_SIZE + 256);
+        for (std::string& line : lines) {
+            if (block.size() + line.size() > OUTPUT_BLOCK_SIZE && !block.empty()) {
+                std::lock_guard<std::mutex> lock(output_mutex);
+                output_blocks[index].push_back(std::move(block));
+                block.clear();
+                block.reserve(OUTPUT_BLOCK_SIZE + 256);
+            }
+            block.append(std::move(line));
+        }
+        if (!block.empty()) {
+            std::lock_guard<std::mutex> lock(output_mutex);
+            output_blocks[index].push_back(std::move(block));
+        }
+        output_lines.fetch_add(local_lines, std::memory_order_relaxed);
+    }
+
+    template<typename EmitBlock>
+    void format_shard_compact(size_t index, size_t k,
+                              size_t& output_lines,
+                              double& formatting_seconds,
+                              EmitBlock&& emit_block) const {
+        const auto format_start = std::chrono::steady_clock::now();
+        const Table& table = *shards_[index].table;
+        std::vector<OutputRecord> records;
+        records.reserve(table.size() * 2);
+        for (const auto& entry : table) {
+            OutputRecord first;
+            for (size_t word = 0; word < WORDS; ++word) {
+                first.kmer[word] = entry.kmer[word];
+            }
+            first.count = table.get_count(entry, TRANSFORM_I) +
+                          table.get_count(entry, TRANSFORM_RC);
+            if (first.count > 0) records.push_back(first);
+
+            const OutputTransform pair_transform =
+                reverse_is_canonical_pair_member(first.kmer.data(), k)
+                    ? OutputTransform::REVERSE
+                    : OutputTransform::COMPLEMENT;
+            OutputRecord second;
+            second.kmer = make_output_kmer(first.kmer.data(), k, pair_transform);
+            second.count = table.get_count(entry, TRANSFORM_R) +
+                           table.get_count(entry, TRANSFORM_C);
+            if (second.count > 0) records.push_back(second);
+        }
+
+        std::sort(records.begin(), records.end(),
+                  [](const OutputRecord& left, const OutputRecord& right) {
+            for (size_t word = 0; word < WORDS; ++word) {
+                const uint64_t differing_bits =
+                    left.kmer[word] ^ right.kmer[word];
+                if (differing_bits != 0) {
+                    const unsigned bit =
+                        static_cast<unsigned>(__builtin_ctzll(differing_bits)) & ~1U;
+                    const uint8_t lhs =
+                        static_cast<uint8_t>((left.kmer[word] >> bit) & 3);
+                    const uint8_t rhs =
+                        static_cast<uint8_t>((right.kmer[word] >> bit) & 3);
+                    return lhs < rhs;
+                }
+            }
+            return left.count < right.count;
+        });
+
+        std::string block;
+        block.reserve(OUTPUT_BLOCK_SIZE + 256);
+        size_t block_lines = 0;
+        for (const OutputRecord& record : records) {
+            append_output_line(block, record.kmer.data(), k,
+                               OutputTransform::IDENTITY, record.count);
+            ++block_lines;
+            ++output_lines;
+            if (block.size() >= OUTPUT_BLOCK_SIZE) {
+                emit_block(std::move(block), block_lines, false);
+                block = std::string();
+                block.reserve(OUTPUT_BLOCK_SIZE + 256);
+                block_lines = 0;
+            }
+        }
+        emit_block(std::move(block), block_lines, true);
+        formatting_seconds += std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - format_start).count();
+    }
+public:
+    explicit ShardedV4Table(size_t expected_entries, const MemoryPlan& plan,
+                            std::atomic<uint64_t>* mutex_wait_ns)
+        : shard_count_(plan.shard_count),
+          shard_bits_(compute_shard_bits(plan.shard_count)),
+          mutex_wait_ns_(mutex_wait_ns) {
+        if (shard_count_ < 2 || shard_count_ > MAX_SHARD_COUNT ||
+            (shard_count_ & (shard_count_ - 1)) != 0) {
+            throw std::invalid_argument("Shard count must be a power of two");
+        }
+        const size_t per_shard = expected_entries / shard_count_ +
+                                 (expected_entries % shard_count_ != 0 ? 1 : 0);
+        for (size_t index = 0; index < shard_count_; ++index) {
+            shards_[index].table =
+                std::make_unique<Table>(per_shard, plan.capacity_per_shard,
+                                         plan.load_percent);
+        }
+    }
+
+    template<bool COALESCE_REPEATS>
+    void add(const uint64_t* kmer_data, Transform transform,
+             WorkerBuffers& buffers) {
+        const size_t hash = Table::compute_hash(kmer_data);
+        const size_t index = shard_index(hash);
+        std::vector<PendingUpdate>& updates = buffers.updates[index];
+        if (updates.capacity() == 0) {
+            updates.reserve(std::min<size_t>(UPDATE_BATCH_SIZE, 128));
+        }
+
+        // Repetitive sequence usually produces a contiguous run of the same
+        // canonical key in a shard. Fold its transform channels in the worker
+        // buffer so millions of observations become a handful of locked probes.
+        if constexpr (COALESCE_REPEATS) {
+            if (!updates.empty() &&
+                keys_equal(updates.back().kmer.data(), kmer_data)) {
+                bool saturated = false;
+                for (auto update = updates.rbegin(); update != updates.rend();
+                     ++update) {
+                    if (!keys_equal(update->kmer.data(), kmer_data)) break;
+                    if (update->transform == transform) {
+                        if (update->count ==
+                            std::numeric_limits<uint32_t>::max()) {
+                            // Preserve an unbounded final count without
+                            // enlarging every pending update.
+                            saturated = true;
+                            break;
+                        }
+                        ++update->count;
+                        return;
+                    }
+                }
+                if (saturated) flush<true>(index, buffers);
+            }
+        }
+
+        PendingUpdate update;
+        for (size_t word = 0; word < WORDS; ++word) {
+            update.kmer[word] = kmer_data[word];
+        }
+        update.transform = transform;
+        update.hash = hash;
+        if (buffers.pending_count >= MAX_PENDING_UPDATES) {
+            size_t largest = 0;
+            for (size_t candidate = 1; candidate < buffers.updates.size(); ++candidate) {
+                if (buffers.updates[candidate].size() > buffers.updates[largest].size()) {
+                    largest = candidate;
+                }
+            }
+            flush<COALESCE_REPEATS>(largest, buffers);
+        }
+        updates.push_back(update);
+        ++buffers.pending_count;
+        if (updates.size() >= UPDATE_BATCH_SIZE) {
+            flush<COALESCE_REPEATS>(index, buffers);
+        }
+    }
+
+    template<bool BULK>
+    void flush_all(WorkerBuffers& buffers) {
+        for (size_t index = 0; index < shard_count_; ++index) {
+            flush<BULK>(index, buffers);
+        }
+    }
+
+    size_t size() const {
+        size_t result = 0;
+        for (size_t index = 0; index < shard_count_; ++index) {
+            result += shards_[index].table->size();
+        }
+        return result;
+    }
+
+    size_t capacity() const {
+        size_t result = 0;
+        for (size_t index = 0; index < shard_count_; ++index) {
+            result += shards_[index].table->capacity();
+        }
+        return result;
+    }
+
+    size_t overflow_size() const {
+        size_t result = 0;
+        for (size_t index = 0; index < shard_count_; ++index) {
+            result += shards_[index].table->overflow_size();
+        }
+        return result;
+    }
+
+    size_t write_output(const std::string& output_file, size_t k,
+                        size_t thread_count, double& formatting_seconds,
+                        double& writing_seconds) const {
+        const size_t formatter_count =
+            std::min({thread_count, shard_count_, MAX_OUTPUT_FORMATTERS});
+
+        struct OutputBlock {
+            std::string data;
+            size_t lines = 0;
+            bool last = false;
+        };
+        using BlockKey = std::pair<size_t, size_t>;
+        std::map<BlockKey, OutputBlock> pending_blocks;
+        const size_t queue_limit = std::max<size_t>(OUTPUT_QUEUE_BLOCKS, 2);
+        std::vector<size_t> shard_lines(shard_count_, 0);
+        std::vector<double> shard_formatting(shard_count_, 0.0);
+        std::mutex output_mutex;
+        std::condition_variable output_cv;
+        size_t next_claim = 0;
+        size_t next_output_shard = 0;
+        size_t queued_blocks = 0;
+        std::exception_ptr formatting_error;
+        std::vector<std::thread> formatters;
+
+        auto formatter = [&] {
+            try {
+                while (true) {
+                    size_t index = 0;
+                    {
+                        std::lock_guard<std::mutex> lock(output_mutex);
+                        if (formatting_error || next_claim >= shard_count_) return;
+                        index = next_claim++;
+                    }
+
+                    size_t next_block = 0;
+                    auto emit_block = [&](std::string block, size_t lines,
+                                          bool last) {
+                        std::unique_lock<std::mutex> lock(output_mutex);
+                        output_cv.wait(lock, [&] {
+                            return formatting_error || queued_blocks < queue_limit ||
+                                   index == next_output_shard;
+                        });
+                        if (formatting_error) {
+                            throw std::runtime_error("Output formatting cancelled");
+                        }
+                        pending_blocks.emplace(
+                            BlockKey{index, next_block++},
+                            OutputBlock{std::move(block), lines, last});
+                        ++queued_blocks;
+                        lock.unlock();
+                        output_cv.notify_all();
+                    };
+                    format_shard_compact(index, k, shard_lines[index],
+                                         shard_formatting[index], emit_block);
+                    output_cv.notify_all();
+                }
+            } catch (...) {
+                {
+                    std::lock_guard<std::mutex> lock(output_mutex);
+                    if (!formatting_error) formatting_error = std::current_exception();
+                }
+                output_cv.notify_all();
+            }
+        };
+
+        formatters.reserve(formatter_count);
+        for (size_t i = 0; i < formatter_count; ++i) {
+            formatters.emplace_back(formatter);
+        }
+
+        RawOutputFile output(output_file);
+        size_t total_lines = 0;
+        for (size_t index = 0; index < shard_count_; ++index) {
+            size_t block_index = 0;
+            bool last = false;
+            while (!last) {
+                OutputBlock block;
+                {
+                    std::unique_lock<std::mutex> lock(output_mutex);
+                    output_cv.wait(lock, [&] {
+                        return formatting_error ||
+                               pending_blocks.find(BlockKey{index, block_index}) !=
+                                   pending_blocks.end();
+                    });
+                    if (formatting_error) break;
+                    auto found = pending_blocks.find(BlockKey{index, block_index});
+                    block = std::move(found->second);
+                    pending_blocks.erase(found);
+                    --queued_blocks;
+                }
+                output_cv.notify_all();
+
+                total_lines += block.lines;
+                const auto write_start = std::chrono::steady_clock::now();
+                output.write(block.data);
+                writing_seconds += std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - write_start).count();
+                last = block.last;
+                ++block_index;
+                if (last) {
+                    std::lock_guard<std::mutex> lock(output_mutex);
+                    next_output_shard = index + 1;
+                    output_cv.notify_all();
+                }
+            }
+            if (formatting_error) break;
+        }
+
+        for (std::thread& thread : formatters) thread.join();
+        output.close();
+        if (formatting_error) std::rethrow_exception(formatting_error);
+        for (double seconds : shard_formatting) formatting_seconds += seconds;
+        return total_lines;
+    }
+#if 0
+            const auto write_start = std::chrono::steady_clock::now();
+        const size_t formatter_count =
+            std::min({thread_count, shard_count_, MAX_OUTPUT_FORMATTERS});
+        std::vector<std::vector<std::string>> output_blocks(shard_count_);
+        std::mutex output_mutex;
+        std::atomic<size_t> next_shard{0};
+        std::atomic<size_t> output_lines{0};
+        std::mutex error_mutex;
+        std::exception_ptr formatter_error;
+
+        auto formatter = [&] {
+            try {
+                while (true) {
+                    const size_t index =
+                        next_shard.fetch_add(1, std::memory_order_relaxed);
+                    if (index >= shard_count_) break;
+                    format_shard(index, k, output_blocks, output_mutex,
+                                 output_lines);
+                }
+            } catch (...) {
+                std::lock_guard<std::mutex> lock(error_mutex);
+                if (!formatter_error) formatter_error = std::current_exception();
+            }
+        };
+
+        std::vector<std::thread> formatters;
+        formatters.reserve(formatter_count);
+        for (size_t i = 0; i < formatter_count; ++i) {
+            formatters.emplace_back(formatter);
+        }
+        for (std::thread& thread : formatters) thread.join();
+        if (formatter_error) std::rethrow_exception(formatter_error);
+
+        RawOutputFile output(output_file);
+        for (size_t index = 0; index < shard_count_; ++index) {
+            for (const std::string& block : output_blocks[index]) {
+                output.write(block);
+            }
+        }
+        output.close();
+        return output_lines.load(std::memory_order_relaxed);
+#endif
+};
+
+template<size_t WORDS, bool COALESCE_REPEATS>
+void process_job(const std::string& job, CompactRollingWindow<WORDS>& window,
+                 ShardedV4Table<WORDS>& table,
+                 typename ShardedV4Table<WORDS>::WorkerBuffers& buffers) {
+    window.reset();
+    for (unsigned char encoded : job) {
+        if (window.add_base(encoded)) {
+            auto canonical = window.get_canonical();
+            table.template add<COALESCE_REPEATS>(
+                canonical.kmer.data(), canonical.transform, buffers);
+        }
+    }
 }
 
-/**
- * @brief Compute reverse of a k-mer (reverse the order of bases)
- * O(k) operation, only used during output
- */
+template<size_t WORDS, bool COALESCE_REPEATS>
+void process_raw_job(const InputJob& job,
+                     CompactRollingWindow<WORDS>& window,
+                     ShardedV4Table<WORDS>& table,
+                     typename ShardedV4Table<WORDS>::WorkerBuffers& buffers) {
+    window.reset();
+    bool in_header = false;
+    bool at_line_start = true;
+    for (size_t index = 0; index < job.bytes.size(); ++index) {
+        const unsigned char c = static_cast<unsigned char>(job.bytes[index]);
+        if (in_header) {
+            if (c == 10) { in_header = false; at_line_start = true; }
+            continue;
+        }
+        if (c == 10) { at_line_start = true; continue; }
+        if (c == 13 || c == 32 || c == 9) continue;
+        if (at_line_start && (c == 62 || c == 59)) {
+            in_header = true;
+            if (c == 62) window.reset();
+            continue;
+        }
+        at_line_start = false;
+        const int8_t code = BASE_ENCODING[c];
+        if (code < 0) { window.reset(); continue; }
+        const bool ready = window.add_base(static_cast<uint8_t>(code));
+        if (index >= job.emit_from && ready) {
+            auto canonical = window.get_canonical();
+            table.template add<COALESCE_REPEATS>(
+                canonical.kmer.data(), canonical.transform, buffers);
+        }
+    }
+}
+
+size_t choose_shard_count_by_estimate(size_t estimated_entries) {
+    size_t target = 8;
+    while (target < MAX_SHARD_COUNT &&
+           target <= std::numeric_limits<size_t>::max() / 4096 &&
+           target * 4096 < estimated_entries / 2) {
+        target <<= 1;
+    }
+    return target;
+}
+
+size_t choose_shard_count(size_t thread_count) {
+    (void)thread_count;
+    // A stable shard topology is part of the byte-for-byte output contract.
+    // It also keeps hash routing comparable across thread counts.
+    return 64;
+}
+
+size_t automatic_memory_budget() {
+    const long pages = sysconf(_SC_PHYS_PAGES);
+    const long page_size = sysconf(_SC_PAGE_SIZE);
+    if (pages > 0 && page_size > 0) {
+        const size_t physical = static_cast<size_t>(pages) *
+                                static_cast<size_t>(page_size);
+        return physical / 2;
+    }
+    return static_cast<size_t>(4ULL * 1024ULL * 1024ULL * 1024ULL);
+}
+
+MemoryPlan make_memory_plan(size_t expected_entries, size_t thread_count,
+                            size_t entry_size, size_t pending_size,
+                            size_t output_record_size,
+                            size_t memory_budget_mb) {
+    MemoryPlan plan;
+    plan.shard_count = choose_shard_count(thread_count);
+    plan.expected_entries = expected_entries;
+    const size_t required = expected_entries == 0
+                                ? plan.shard_count * 64
+                                : (expected_entries * 100 + plan.load_percent - 1) / plan.load_percent;
+    plan.capacity_total = std::max<size_t>(required, plan.shard_count * 64);
+    plan.capacity_per_shard = (plan.capacity_total + plan.shard_count - 1) /
+                              plan.shard_count;
+    plan.capacity_total = plan.capacity_per_shard * plan.shard_count;
+    plan.table_bytes = plan.capacity_total * entry_size;
+    plan.overflow_bytes = std::max<size_t>(sizeof(uint64_t) * 8,
+                                           expected_entries / 20);
+    const size_t queue_capacity = std::max<size_t>(thread_count * 4, 8);
+    plan.input_buffer_bytes = queue_capacity * WINDOWS_PER_JOB;
+    plan.update_buffer_bytes = thread_count * plan.shard_count *
+                               MAX_PENDING_UPDATES * pending_size;
+    const size_t formatter_count =
+        std::min({thread_count, plan.shard_count, MAX_OUTPUT_FORMATTERS});
+    const size_t records_per_shard =
+        ((expected_entries + plan.shard_count - 1) / plan.shard_count) * 2;
+    plan.output_buffer_bytes =
+        formatter_count * records_per_shard * output_record_size +
+        OUTPUT_QUEUE_BLOCKS * OUTPUT_BLOCK_SIZE;
+    plan.estimated_bytes = plan.table_bytes + plan.overflow_bytes +
+                           plan.input_buffer_bytes + plan.update_buffer_bytes +
+                           plan.output_buffer_bytes;
+    plan.budget_bytes = memory_budget_mb == 0
+                            ? automatic_memory_budget()
+                            : memory_budget_mb * 1024ULL * 1024ULL;
+    return plan;
+}
+
 template<size_t WORDS>
-CompactKmer<WORDS> compute_reverse_kmer(const CompactKmer<WORDS>& kmer, size_t k) {
-    CompactKmer<WORDS> result;
-    for (size_t i = 0; i < k; ++i) {
-        // Get base at position i
-        size_t src_bit = 2 * i;
-        size_t src_word = src_bit >> 6;
-        size_t src_offset = src_bit & 63;
-        uint8_t base = (kmer.data()[src_word] >> src_offset) & 3;
+int run_parallel(const std::string& input_file, size_t k,
+                 const std::string& output_file, size_t file_size,
+                 size_t thread_count, size_t memory_budget_mb) {
+    ParallelSequenceReader reader(input_file);
+    const char* format = reader.format() == FileFormat::FASTA ? "FASTA" : "FASTQ";
+    const char* compression =
+        reader.compression() == CompressionType::GZIP ? " (gzip)" : "";
+    const size_t estimated = estimate_unique_kmers(
+        file_size, k, reader.format(), reader.compression());
 
-        // Put at position (k-1-i)
-        size_t dst_bit = 2 * (k - 1 - i);
-        size_t dst_word = dst_bit >> 6;
-        size_t dst_offset = dst_bit & 63;
-        result.data()[dst_word] |= static_cast<uint64_t>(base) << dst_offset;
+    std::cerr << "Format: " << format << compression << '\n';
+    std::cerr << "Workers: " << thread_count << '\n';
+    const MemoryPlan plan = make_memory_plan(
+        estimated, thread_count, sizeof(typename CompactHashTable<WORDS>::Entry),
+        sizeof(typename ShardedV4Table<WORDS>::PendingUpdate),
+        sizeof(typename ShardedV4Table<WORDS>::OutputRecord),
+        memory_budget_mb);
+    if (plan.estimated_bytes > plan.budget_bytes) {
+        throw std::runtime_error(
+            "Memory budget exceeded: estimated " +
+            std::to_string(plan.estimated_bytes / (1024 * 1024)) +
+            " MiB, limit " + std::to_string(plan.budget_bytes / (1024 * 1024)) +
+            " MiB; shards=" + std::to_string(plan.shard_count) +
+            ", capacity=" + std::to_string(plan.capacity_total) +
+            ". Reduce threads or use a smaller input.");
     }
-    return result;
-}
+    const size_t shard_count = plan.shard_count;
+    std::cerr << "Memory plan: estimated " << plan.estimated_bytes / (1024 * 1024)
+              << " MiB, budget " << plan.budget_bytes / (1024 * 1024)
+              << " MiB, capacity " << plan.capacity_total << '\n';
+    std::cerr << "Estimated table memory: " << plan.table_bytes / (1024 * 1024)
+              << " MiB\n";
+    std::cerr << "Output buffer memory: " << plan.output_buffer_bytes / (1024 * 1024)
+              << " MiB\n";
+    std::cerr << "Hash shards: " << shard_count << '\n';
+    std::cerr << "Estimated unique k-mers: " << estimated << '\n';
 
-/**
- * @brief Compute reverse-complement of a k-mer
- */
-template<size_t WORDS>
-CompactKmer<WORDS> compute_revcomp_kmer(const CompactKmer<WORDS>& kmer, size_t k) {
-    return compute_complement_kmer(compute_reverse_kmer(kmer, k), k);
-}
+    std::atomic<uint64_t> shard_mutex_wait_ns{0};
+    ShardedV4Table<WORDS> table(estimated, plan, &shard_mutex_wait_ns);
+    const size_t queue_capacity = std::max<size_t>(thread_count * 4, 8);
+    JobQueue queue(queue_capacity);
+    std::mutex error_mutex;
+    std::exception_ptr worker_error;
+    std::atomic<size_t> coalesced_jobs{0};
 
-/**
- * @brief Estimate unique k-mers based on file characteristics
- *
- * Uses format-aware heuristics to avoid over-allocation:
- * - FASTQ has ~4x overhead (header, +, quality lines)
- * - Gzip typically compresses genomic data 3-5x
- * - Caps estimate at 4^k (maximum possible unique k-mers)
- */
-size_t estimate_unique_kmers(size_t file_size, size_t k, FileFormat format, CompressionType compression) {
-    // Estimate actual sequence bytes
-    size_t seq_bytes = file_size;
+    auto worker = [&] {
+        try {
+            CompactRollingWindow<WORDS> window(k);
+            typename ShardedV4Table<WORDS>::WorkerBuffers buffers(shard_count);
+            bool have_buffer_mode = false;
+            bool bulk_buffer_mode = false;
+            InputJob job;
+            while (queue.pop(job)) {
+                const bool repetitive = is_repetitive_job(job.bytes);
+                if (have_buffer_mode && repetitive != bulk_buffer_mode) {
+                    if (bulk_buffer_mode) {
+                        table.template flush_all<true>(buffers);
+                    } else {
+                        table.template flush_all<false>(buffers);
+                    }
+                }
+                have_buffer_mode = true;
+                bulk_buffer_mode = repetitive;
 
-    // For gzipped files, estimate decompressed size (typically 3-5x larger)
-    if (compression == CompressionType::GZIP) {
-        seq_bytes = file_size * 4;  // Conservative estimate
+                if (repetitive) {
+                    coalesced_jobs.fetch_add(1, std::memory_order_relaxed);
+                    if (job.raw_fasta) {
+                        process_raw_job<WORDS, true>(job, window, table, buffers);
+                    } else {
+                        process_job<WORDS, true>(job.bytes, window, table, buffers);
+                    }
+                } else if (job.raw_fasta) {
+                    process_raw_job<WORDS, false>(job, window, table, buffers);
+                } else {
+                    process_job<WORDS, false>(job.bytes, window, table, buffers);
+                }
+            }
+            if (have_buffer_mode) {
+                if (bulk_buffer_mode) {
+                    table.template flush_all<true>(buffers);
+                } else {
+                    table.template flush_all<false>(buffers);
+                }
+            }
+        } catch (...) {
+            {
+                std::lock_guard<std::mutex> lock(error_mutex);
+                if (!worker_error) worker_error = std::current_exception();
+            }
+            queue.cancel();
+        }
+    };
+
+    const auto counting_start = std::chrono::steady_clock::now();
+    std::vector<std::thread> workers;
+    workers.reserve(thread_count);
+    for (size_t i = 0; i < thread_count; ++i) workers.emplace_back(worker);
+
+    std::exception_ptr producer_error;
+    try {
+        reader.produce(k, queue);
+        queue.close();
+    } catch (const ProcessingCancelled&) {
+        queue.cancel();
+    } catch (...) {
+        producer_error = std::current_exception();
+        queue.cancel();
     }
 
-    // FASTQ: ~25% is sequence (header, seq, +, quality = 4 lines, seq is ~1/4)
-    // FASTA: ~90% is sequence (just headers to skip)
-    if (format == FileFormat::FASTQ) {
-        seq_bytes = seq_bytes / 4;
-    } else {
-        seq_bytes = (seq_bytes * 9) / 10;
-    }
+    for (std::thread& thread : workers) thread.join();
+    if (worker_error) std::rethrow_exception(worker_error);
+    if (producer_error) std::rethrow_exception(producer_error);
 
-    // Maximum possible unique k-mers is 4^k, but cap at 2^62 to avoid overflow
-    size_t max_possible = (k <= 31) ? (1ULL << (2 * k)) : (1ULL << 62);
+    const auto counting_end = std::chrono::steady_clock::now();
+    const double counting_seconds =
+        std::chrono::duration<double>(counting_end - counting_start).count();
+    std::cerr << "Queue wait time: " << queue.wait_ns() / 1e9 << " s\n";
+    std::cerr << "Shard mutex wait time: " << shard_mutex_wait_ns.load() / 1e9 << " s\n";
 
-    // For genomic data with k >= 15, most k-mers are unique
-    // Total possible k-mers in sequence: seq_bytes - k + 1
-    // Empirically, Klein V4 equivalence classes ≈ seq_bytes for bacterial genomes
-    // Use 120% of seq_bytes as safety margin (observed: actual can exceed estimate)
-    size_t estimated = (seq_bytes * 12) / 10;
-
-    // Minimum reasonable size
-    if (estimated < 1000000) estimated = 1000000;
-
-    return std::min(estimated, max_possible);
-}
-
-void print_usage(const char* program) {
-    std::cerr << "v4mer 1.0 - Klein V₄ k-mer counter (Jellyfish-compatible)\n\n";
-    std::cerr << "Usage: " << program << " <input> <k> <output.txt>\n\n";
-    std::cerr << "Supported formats (auto-detected):\n";
-    std::cerr << "  FASTA:  .fa, .fasta, .fa.gz, .fasta.gz\n";
-    std::cerr << "  FASTQ:  .fq, .fastq, .fq.gz, .fastq.gz\n\n";
-    std::cerr << "Examples:\n";
-    std::cerr << "  " << program << " genome.fa 29 output.txt\n";
-    std::cerr << "  " << program << " reads.fastq.gz 21 output.txt\n";
-}
-
-// ============================================================================
-// MAIN - Dispatches to correct template instantiation based on k
-// ============================================================================
-
-template<size_t WORDS>
-int run_counting(const std::string& input_file, size_t k, const std::string& output_file,
-                 size_t file_size) {
-    std::cerr << "Using " << WORDS << "-word entries (" << (WORDS * 8 + 4) << " bytes each)\n\n";
-
-    // Detect format first for better estimation
-    SequenceReader reader(input_file);
-
-    const char* format_str = (reader.format() == FileFormat::FASTA) ? "FASTA" : "FASTQ";
-    const char* comp_str = (reader.compression() == CompressionType::GZIP) ? " (gzip)" : "";
-    std::cerr << "Format: " << format_str << comp_str << "\n";
-
-    // Use improved capacity estimation
-    size_t estimated_kmers = estimate_unique_kmers(file_size, k, reader.format(), reader.compression());
-    std::cerr << "Estimated unique k-mers: " << estimated_kmers << "\n";
-
-    CompactHashTable<WORDS> table(k, estimated_kmers);
-
-    std::cerr << "Counting canonical k-mers...\n";
-
-    reader.count_kmers(k, table);
-
-    std::cerr << "Found " << table.size() << " distinct equivalence classes\n";
-    std::cerr << "Hash table load factor: " << (table.load_factor() * 100) << "%\n";
+    std::cerr << "Found " << table.size() << " distinct V4 classes\n";
+    std::cerr << "Hash table capacity: " << table.capacity() << " entries\n";
+    std::cerr << "Hash table load factor: "
+              << (100.0 * static_cast<double>(table.size()) /
+                  static_cast<double>(table.capacity()))
+              << "%\n";
     if (table.overflow_size() > 0) {
-        std::cerr << "Overflow entries (counts > 254): " << table.overflow_size() << "\n";
+        std::cerr << "Overflow entries: " << table.overflow_size() << '\n';
     }
+    std::cerr << "Coalesced low-complexity jobs: "
+              << coalesced_jobs.load(std::memory_order_relaxed) << '\n';
+    std::cerr << "Parallel counting time: " << counting_seconds << " s\n";
     std::cerr << "Writing output...\n";
+    std::cerr << "Output sort: packed-2bit key\n";
+    std::cerr << "Output formatting: direct block append\n";
 
-    std::ofstream output(output_file);
-    if (!output) {
-        std::cerr << "Error: Cannot open output file\n";
-        return 1;
-    }
-
-    size_t output_lines = 0;
-
-    for (const auto& entry : table) {
-        CompactKmer<WORDS> canonical;
-        for (size_t i = 0; i < WORDS; ++i) {
-            canonical.data()[i] = entry.kmer[i];
-        }
-
-        // Compute all 4 variants from the Klein canonical
-        CompactKmer<WORDS> kmer_C = compute_complement_kmer(canonical, k);
-        CompactKmer<WORDS> kmer_R = compute_reverse_kmer(canonical, k);
-        CompactKmer<WORDS> kmer_RC = compute_revcomp_kmer(canonical, k);
-
-        // Get full counts (handles overflow automatically)
-        uint64_t count_I = table.get_count(entry, TRANSFORM_I);
-        uint64_t count_R = table.get_count(entry, TRANSFORM_R);
-        uint64_t count_C = table.get_count(entry, TRANSFORM_C);
-        uint64_t count_RC = table.get_count(entry, TRANSFORM_RC);
-
-        // Jellyfish pair 1: {I, RC} - forward and reverse-complement
-        // Jellyfish pair 2: {R, C}  - reverse and complement
-        uint64_t count_pair1 = count_I + count_RC;
-        uint64_t count_pair2 = count_R + count_C;
-
-        if (count_pair1 > 0) {
-            CompactKmer<WORDS> jf_canon1 = (canonical < kmer_RC) ? canonical : kmer_RC;
-            output << kmer_to_string(jf_canon1.data(), k) << '\t' << count_pair1 << '\n';
-            ++output_lines;
-        }
-
-        if (count_pair2 > 0) {
-            CompactKmer<WORDS> jf_canon2 = (kmer_R < kmer_C) ? kmer_R : kmer_C;
-            output << kmer_to_string(jf_canon2.data(), k) << '\t' << count_pair2 << '\n';
-            ++output_lines;
-        }
-    }
-
+    const auto output_start = std::chrono::steady_clock::now();
+    double formatting_seconds = 0.0;
+    double writing_seconds = 0.0;
+    const size_t output_lines = table.write_output(
+        output_file, k, thread_count, formatting_seconds, writing_seconds);
+    const double output_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - output_start).count();
     std::cerr << "Wrote " << output_lines << " output lines\n";
-    std::cerr << "Done.\n";
+    std::cerr << "Output time: " << output_seconds << " s\n";
+    std::cerr << "Formatting time: " << formatting_seconds << " s\n";
+    std::cerr << "Writing time: " << writing_seconds << " s\n";
     return 0;
 }
 
+bool parse_size(const char* text, size_t& value) {
+    const char* end = text + std::strlen(text);
+    const auto parsed = std::from_chars(text, end, value);
+    return parsed.ec == std::errc() && parsed.ptr == end;
+}
+
+void print_parallel_usage(const char* program) {
+    std::cerr << "v4mer 2026-07-16 - parallel Klein V4 k-mer counter\n\n";
+    std::cerr << "Usage: " << program
+              << " <input> <k> <output.txt> [-t|--threads N]\n";
+}
+
+}  // namespace parallel_v4mer
+
 int main(int argc, char* argv[]) {
-    if (argc != 4) {
-        print_usage(argv[0]);
+    using namespace parallel_v4mer;
+    if (argc < 4 || ((argc - 4) % 2) != 0) {
+        print_parallel_usage(argv[0]);
         return 1;
     }
 
-    std::string input_file = argv[1];
-    int k = std::atoi(argv[2]);
-    std::string output_file = argv[3];
-
-    if (k < 1 || k > 127) {
+    size_t k = 0;
+    if (!parse_size(argv[2], k) || k < 1 || k > 127) {
         std::cerr << "Error: k must be between 1 and 127\n";
         return 1;
     }
 
-    std::cerr << "v4mer 1.0 - Klein V₄ k-mer counter\n";
-    std::cerr << "==================================\n";
-    std::cerr << "Input:  " << input_file << "\n";
-    std::cerr << "K:      " << k << "\n";
-    std::cerr << "Output: " << output_file << "\n";
+    size_t hardware_threads = std::thread::hardware_concurrency();
+    if (hardware_threads == 0) hardware_threads = 1;
+    size_t thread_count = std::min<size_t>(hardware_threads, 8);
+    size_t memory_budget_mb = 0;
+    for (int arg = 4; arg < argc; arg += 2) {
+        const std::string option = argv[arg];
+        size_t value = 0;
+        if (arg + 1 >= argc || !parse_size(argv[arg + 1], value)) {
+            std::cerr << "Error: option value must be an integer\n";
+            return 1;
+        }
+        if (option == "-t" || option == "--threads") {
+            if (value < 1 || value > 256) {
+                std::cerr << "Error: thread count must be between 1 and 256\n";
+                return 1;
+            }
+            thread_count = value;
+        } else if (option == "--memory-budget-mb") {
+            memory_budget_mb = value;
+        } else {
+            std::cerr << "Error: unknown option " << option << '\n';
+            return 1;
+        }
+    }
 
-    struct stat file_stat;
+    const std::string input_file = argv[1];
+    const std::string output_file = argv[3];
+    struct stat file_stat {};
     size_t file_size = 0;
-    if (stat(input_file.c_str(), &file_stat) == 0) {
+    if (stat(input_file.c_str(), &file_stat) == 0 && file_stat.st_size > 0) {
         file_size = static_cast<size_t>(file_stat.st_size);
     }
 
-    size_t words_needed = (2 * k + 63) / 64;
+    std::cerr << "v4mer 2026-07-16 - parallel Klein V4 k-mer counter\n";
+    std::cerr << "===================================================\n";
+    std::cerr << "Input: " << input_file << '\n';
+    std::cerr << "K: " << k << '\n';
+    std::cerr << "Output: " << output_file << '\n';
 
-    if (words_needed == 1) {
-        return run_counting<1>(input_file, k, output_file, file_size);
-    } else if (words_needed == 2) {
-        return run_counting<2>(input_file, k, output_file, file_size);
-    } else if (words_needed == 3) {
-        return run_counting<3>(input_file, k, output_file, file_size);
-    } else {
-        return run_counting<4>(input_file, k, output_file, file_size);
+    try {
+        const size_t words = (2 * k + 63) / 64;
+        if (words == 1) {
+            return run_parallel<1>(input_file, k, output_file, file_size,
+                                   thread_count, memory_budget_mb);
+        }
+        if (words == 2) {
+            return run_parallel<2>(input_file, k, output_file, file_size,
+                                   thread_count, memory_budget_mb);
+        }
+        if (words == 3) {
+            return run_parallel<3>(input_file, k, output_file, file_size,
+                                   thread_count, memory_budget_mb);
+        }
+        return run_parallel<4>(input_file, k, output_file, file_size,
+                               thread_count, memory_budget_mb);
+    } catch (const std::exception& error) {
+        std::cerr << "Error: " << error.what() << '\n';
+        return 1;
     }
 }
+
