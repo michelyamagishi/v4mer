@@ -3,7 +3,7 @@
 > Parallel DNA k-mer counter based on full Klein four-group (V₄) canonicalization.
 
 V4mer is designed for reproducible, memory-controlled k-mer counting with
-Jellyfish-compatible output. It is distributed as a single executable and has
+Jellyfish-compatible output. It is distributed as two small executables and has
 no runtime dependency beyond zlib.
 
 ## At a glance
@@ -16,7 +16,7 @@ no runtime dependency beyond zlib.
 | Parallelism | `1..256` worker threads |
 | Memory control | Optional `--memory-budget-mb` limit |
 | Temporary files | None; counting remains in memory |
-| Output | Tab-separated k-mer/count pairs compatible with Jellyfish |
+| Output | Deterministic TSV; optional native Jellyfish `.jf` conversion |
 
 ## Theoretical framework
 
@@ -41,7 +41,7 @@ Requirements: a C++17 compiler, GNU Make, and zlib.
 make
 ```
 
-The resulting executable is `./v4mer`.
+The resulting executables are `./v4mer` and `./v4mer-jf`.
 
 ## Usage
 
@@ -54,6 +54,7 @@ Examples:
 ```bash
 ./v4mer genome.fa 21 kmers.txt --threads 8
 ./v4mer reads.fastq.gz 31 kmers.txt --threads 8 --memory-budget-mb 4096
+./v4mer-jf kmers.txt kmers.jf
 ```
 
 ### Options
@@ -80,6 +81,26 @@ For direct comparison with Jellyfish, normalize both outputs to
 `kmer<TAB>count`, sort by k-mer and count, and compare the resulting streams.
 The validated release outputs contain the same k-mers with the same counts as
 Jellyfish for every tested dataset and k value.
+
+### Native Jellyfish output
+
+Some downstream tools require Jellyfish's binary database format rather than
+text. Convert the deterministic V4mer output with the separate `v4mer-jf`
+utility:
+
+```bash
+./v4mer INPUT K OUTPUT.tsv --threads 8
+./v4mer-jf OUTPUT.tsv OUTPUT.jf
+jellyfish info OUTPUT.jf
+jellyfish query OUTPUT.jf ACGT...
+jellyfish dump -c -t OUTPUT.jf
+```
+
+`v4mer-jf` is self-contained and targets the native `binary/sorted` format of
+Jellyfish 2.3.1 on little-endian systems. The converter canonicalizes and
+aggregates the same ordinary `{I,RC}` key/count projection consumed by
+Jellyfish. A `.jf` file does not preserve the four independent V₄ channels;
+retain the V4mer TSV output when those channels are required.
 
 ## Benchmark results
 
